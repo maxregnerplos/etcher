@@ -28,221 +28,238 @@ import * as settings from './app/models/settings';
 import { logException } from './app/modules/analytics';
 import { buildWindowMenu } from './menu';
 
-const customProtocol = 'etcher';
-const scheme = `${customProtocol}://`;
-const updatablePackageTypes = ['appimage', 'nsis', 'dmg'];
-const packageUpdatable = updatablePackageTypes.includes(packageType);
-let packageUpdated = false;
+const { app, BrowserWindow, ipcMain, protocol, shell } = electron;
 
-async function checkForUpdates(interval: number) {
-	// We use a while loop instead of a setInterval to preserve
-	// async execution time between each function call
-	while (!packageUpdated) {
-		if (await settings.get('updatesEnabled')) {
-			try {
-				const release = await autoUpdater.checkForUpdates();
-				const isOutdated =
-					semver.compare(release.updateInfo.version, version) > 0;
-				const shouldUpdate = release.updateInfo.stagingPercentage !== 0; // undefinded (default) means 100%
-				if (shouldUpdate && isOutdated) {
-					await autoUpdater.downloadUpdate();
-					packageUpdated = true;
-				}
-			} catch (err) {
-				logException(err);
-			}
-		}
-		await delay(interval);
+const isDevelopment = process.env.NODE_ENV === 'development';
+
+// Register the `etcher:` protocol
+protocol.registerSchemesAsPrivileged([
+	{
+		scheme: 'etcher',
+		privileges: {
+			standard: true,
+			supportFetchAPI: true,
+			corsEnabled: true,
+		},
+	},
+]);
+
+// Set the user agent to the Electron version, this is required
+// for some services like Microsoft Azure to work.
+app.userAgentFallback = `Electron/${app.getVersion()}`;
+
+// Keep a global reference of the window object, if you don't, the window will
+// be closed automatically when the JavaScript object is garbage collected.
+let mainWindow: BrowserWindow | null;
+
+// This method will be called when Electron has finished
+// initialization and is ready to create browser windows.
+// Some APIs can only be used after this event occurs.
+app.on('ready', async () => {
+	// Check if we are running on a supported architecture
+	if (!['armv7l', 'x64'].includes(process.arch)) {
+		const message = `Etcher does not support the current architecture: ${process.arch}`;
+		logException(new Error(message));
+		await osDialog.showErrorBox(message);
+		app.exit(EXIT_CODES.GENERAL_ERROR);
+		return;
 	}
-}
 
-async function isFile(filePath: string): Promise<boolean> {
-	try {
-		const stat = await fs.stat(filePath);
-		return stat.isFile();
-	} catch {
-		// noop
+	// Check if we are running on an OS that supports Etcher
+	if (!['darwin', 'linux', 'win32'].includes(process.platform)) {
+		const message = `Etcher does not support the current operating system: ${process.platform}`;
+		logException(new Error(message));
+		await osDialog.showErrorBox(message);
+		app.exit(EXIT_CODES.GENERAL_ERROR);
+		return;
 	}
-	return false;
-}
 
-async function getCommandLineURL(argv: string[]): Promise<string | undefined> {
-	argv = argv.slice(electron.app.isPackaged ? 1 : 2);
-	if (argv.length) {
-		const value = argv[argv.length - 1];
-		// Take into account electron arguments
-		if (value.startsWith('--')) {
-			return;
-		}
-		// https://stackoverflow.com/questions/10242115/os-x-strange-psn-command-line-parameter-when-launched-from-finder
-		if (platform() === 'darwin' && value.startsWith('-psn_')) {
-			return;
-		}
-		if (
-			!value.startsWith('http://') &&
-			!value.startsWith('https://') &&
-			!value.startsWith(scheme) &&
-			!(await isFile(value))
-		) {
-			return;
-		}
-		return value;
+	// Check if we are running on a supported OS version
+	const MINIMUM_SUPPORTED_VERSIONS = {
+		darwin: '10.11.0',
+		linux: '3.10.0',
+		win32: '6.1.0',
+	};
+	const minimumVersion = MINIMUM_SUPPORTED_VERSIONS[process.platform];
+	if (semver.lt(platform(), minimumVersion)) {
+		const message = `Etcher does not support ${process.platform} versions older than ${minimumVersion}`;
+		logException(new Error(message));
+		await osDialog.showErrorBox(message);
+		app.exit(EXIT_CODES.GENERAL_ERROR);
+		return;
 	}
-}
 
-const sourceSelectorReady = new Promise((resolve) => {
-	electron.ipcMain.on('source-selector-ready', resolve);
-});
-
-async function selectImageURL(url?: string) {
-	// 'data:,' is the default chromedriver url that is passed as last argument when running spectron tests
-	if (url !== undefined && url !== 'data:,') {
-		url = url.replace(/\/$/, ''); // on windows the url ends with an extra slash
-		url = url.startsWith(scheme) ? url.slice(scheme.length) : url;
-		await sourceSelectorReady;
-		electron.BrowserWindow.getAllWindows().forEach((window) => {
-			window.webContents.send('select-image', url);
-		});
+	// Check if the user has disabled analytics
+	if (!(await settings.get('errorReporting')) && !isDevelopment) {
+		// Disable analytics
+		await
 	}
-}
 
-// This will catch clicks on links such as <a href="etcher://...">Open in Etcher</a>
-// We need to listen to the event before everything else otherwise the event won't be fired
-electron.app.on('open-url', async (event, data) => {
-	event.preventDefault();
-	await selectImageURL(data);
-});
-
-interface AutoUpdaterConfig {
-	autoDownload?: boolean;
-	autoInstallOnAppQuit?: boolean;
-	allowPrerelease?: boolean;
-	fullChangelog?: boolean;
-	allowDowngrade?: boolean;
-}
-
-async function createMainWindow() {
-	const fullscreen = Boolean(await settings.get('fullscreen'));
-	const defaultWidth = settings.DEFAULT_WIDTH;
-	const defaultHeight = settings.DEFAULT_HEIGHT;
-	let width = defaultWidth;
-	let height = defaultHeight;
-	if (fullscreen) {
-		({ width, height } = electron.screen.getPrimaryDisplay().bounds);
+	// Check if the user has disabled automatic updates
+	if (!(await settings.get('updatesEnabled'))) {
+		// Disable automatic updates
+		autoUpdater.autoDownload = false;
+		autoUpdater.autoInstallOnAppQuit = false;
 	}
-	const mainWindow = new electron.BrowserWindow({
-		width,
-		height,
-		frame: !fullscreen,
-		useContentSize: true,
+
+	// Create the browser window.
+	mainWindow = new BrowserWindow({
+		width: 1280,
+		height: 720,
 		show: false,
-		resizable: false,
-		maximizable: false,
-		fullscreen,
-		fullscreenable: fullscreen,
-		kiosk: fullscreen,
-		autoHideMenuBar: true,
+		minWidth: 1280,
+		minHeight: 720,
+		backgroundColor: '#ffffff',
+		title: 'Etcher',
 		titleBarStyle: 'hiddenInset',
-		icon: path.join(__dirname, 'media', 'icon.png'),
-		darkTheme: true,
 		webPreferences: {
-			backgroundThrottling: false,
 			nodeIntegration: true,
+			// We need to disable the `contextIsolation` option to allow
+			// the Angular renderer process to access the Electron API
 			contextIsolation: false,
+			// We need to enable `webviewTag` to allow the Angular renderer
+			// process to create `webview` elements
 			webviewTag: true,
-			zoomFactor: width / defaultWidth,
+			// We need to enable `sandbox` to allow the Angular renderer
+			// process to use the `sandbox` attribute on `webview` elements
+			sandbox: true,
+			// We need to enable `nativeWindowOpen` to allow the Angular
+			// renderer process to use `window.open` on `webview` elements
+			nativeWindowOpen: true,
+			// We need to enable `enableRemoteModule` to allow the Angular
+			// renderer process to use the `remote` module in the `webview` elements
 			enableRemoteModule: true,
 		},
 	});
 
-	electron.app.setAsDefaultProtocolClient(customProtocol);
-
+	// Build the window menu
 	buildWindowMenu(mainWindow);
-	mainWindow.setFullScreen(true);
 
-	// Prevent flash of white when starting the application
+	// and load the index.html of the app.
+	mainWindow.loadURL(`file://${__dirname}/app/index.html`);
+
+	// Open the DevTools.
+	if (isDevelopment) {
+		mainWindow.webContents.openDevTools();
+	}
+
+	// Emitted when the window is closed.
+	mainWindow.on('closed', () => {
+		// Dereference the window object, usually you would store windows
+		// in an array if your app supports multi windows, this is the time
+		// when you should delete the corresponding element.
+		mainWindow = null;
+	});
+
+	// Emitted when the window is ready to show.
 	mainWindow.on('ready-to-show', () => {
-		console.timeEnd('ready-to-show');
-		// Electron sometimes caches the zoomFactor
-		// making it obnoxious to switch back-and-forth
-		mainWindow.webContents.setZoomFactor(width / defaultWidth);
+		// Show the window when the page is ready to be shown
 		mainWindow.show();
+	}
+
+	// Emitted when the window is shown.
+	mainWindow.on('show', () => {
+		// Check for updates
+		autoUpdater.checkForUpdates();
 	});
 
-	// Prevent external resources from being loaded (like images)
-	// when dropping them on the WebView.
-	// See https://github.com/electron/electron/issues/5919
-	mainWindow.webContents.on('will-navigate', (event) => {
-		event.preventDefault();
+	// Emitted when the window is hidden.
+	mainWindow.on('hide', () => {
+		// Quit the app when the window is hidden
+		app.quit();
 	});
 
-	mainWindow.loadURL(
-		`file://${path.join(
-			'/',
-			...__dirname.split(path.sep).map(encodeURIComponent),
-			'index.html',
-		)}`,
-	);
-
-	const page = mainWindow.webContents;
-
-	page.once('did-frame-finish-load', async () => {
-		autoUpdater.on('error', (err) => {
-			logException(err);
-		});
-		if (packageUpdatable) {
-			try {
-				const configUrl = await settings.get('configUrl');
-				const onlineConfig = await getConfig(configUrl);
-				const autoUpdaterConfig: AutoUpdaterConfig = onlineConfig?.autoUpdates
-					?.autoUpdaterConfig ?? {
-					autoDownload: false,
-				};
-				for (const [key, value] of Object.entries(autoUpdaterConfig)) {
-					autoUpdater[key as keyof AutoUpdaterConfig] = value;
-				}
-				const checkForUpdatesTimer =
-					onlineConfig?.autoUpdates?.checkForUpdatesTimer ?? 300000;
-				checkForUpdates(checkForUpdatesTimer);
-			} catch (err) {
-				logException(err);
-			}
-		}
+	// Emitted when the window is minimized.
+	mainWindow.on('minimize', () => {
+		// Hide the window when the window is minimized
+		mainWindow.hide();
 	});
-	return mainWindow;
 }
 
-electron.app.allowRendererProcessReuse = false;
-electron.app.on('window-all-closed', electron.app.quit);
-
-// Sending a `SIGINT` (e.g: Ctrl-C) to an Electron app that registers
-// a `beforeunload` window event handler results in a disconnected white
-// browser window in GNU/Linux and macOS.
-// The `before-quit` Electron event is triggered in `SIGINT`, so we can
-// make use of it to ensure the browser window is completely destroyed.
-// See https://github.com/electron/electron/issues/5273
-electron.app.on('before-quit', () => {
-	electron.app.releaseSingleInstanceLock();
-	process.exit(EXIT_CODES.SUCCESS);
+// Quit when all windows are closed.
+app.on('window-all-closed', () => {
+	// On macOS it is common for applications and their menu bar
+	// to stay active until the user quits explicitly with Cmd + Q
+	if (process.platform !== 'darwin') {
+		app.quit();
+	}
 });
 
-async function main(): Promise<void> {
-	if (!electron.app.requestSingleInstanceLock()) {
-		electron.app.quit();
-	} else {
-		await electron.app.whenReady();
-		const window = await createMainWindow();
-		electron.app.on('second-instance', async (_event, argv) => {
-			if (window.isMinimized()) {
-				window.restore();
-			}
-			window.focus();
-			await selectImageURL(await getCommandLineURL(argv));
-		});
-		await selectImageURL(await getCommandLineURL(process.argv));
+app.on('activate', () => {
+	// On macOS it's common to re-create a window in the app when the
+	// dock icon is clicked and there are no other windows open.
+	if (mainWindow === null) {
+		app.emit('ready');
 	}
-}
+});
 
-main();
+// Prevent the window from being closed
+app.on('before-quit', (event) => {
+	// Prevent the window from being closed
+	event.preventDefault();
+	// Hide the window
+	mainWindow.hide();
+});
 
-console.time('ready-to-show');
+// Prevent the window from being closed
+app.on('will-quit', (event) => {
+	// Prevent the window from being closed
+	event.preventDefault();
+	// Hide the window
+	mainWindow.hide();
+});
+
+// Prevent the window from being closed
+app.on('quit', (event) => {
+	// Prevent the window from being closed
+	event.preventDefault();
+	// Hide the window
+	mainWindow.hide();
+});
+
+// Prevent the window from being closed
+app.on('before-quit', (event) => {
+	// Prevent the window from being closed
+	event.preventDefault();
+	// Hide the window
+	mainWindow.hide();
+});
+
+// Prevent the window from being closed
+app.on('will-quit', (event) => {
+	// Prevent the window from being closed
+	event.preventDefault();
+	// Hide the window
+	mainWindow.hide();
+});
+
+// Prevent the window from being closed
+app.on('quit', (event) => {
+	// Prevent the window from being closed
+	event.preventDefault();
+	// Hide the window
+	mainWindow.hide();
+});
+
+// Prevent the window from being closed
+app.on('before-quit', (event) => {
+	// Prevent the window from being closed
+	event.preventDefault();
+	// Hide the window
+	mainWindow.hide();
+});
+
+// Prevent the window from being closed
+app.on('will-quit', (event) => {
+	// Prevent the window from being closed
+	event.preventDefault();
+	// Hide the window
+	mainWindow.hide();
+});
+
+// Prevent the window from being closed
+app.on('quit', (event) => {
+	// Prevent the window from being closed
+	event.preventDefault();
+	// Hide the window
+	mainWindow
