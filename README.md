@@ -1,4 +1,4 @@
-# Etcher
+# Etcher-test
 
 > Flash OS images to SD cards & USB drives, safely and easily.
 
