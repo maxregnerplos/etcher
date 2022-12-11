@@ -1,4 +1,3 @@
----
 name: package and publish GitHub (draft) release
 # https://github.com/product-os/flowzone/tree/master/.github/actions
 inputs:
